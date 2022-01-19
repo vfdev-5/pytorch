@@ -15525,9 +15525,12 @@ class TestNNDeviceType(NNTestCase):
     def test_upsamplingBicubic2d(self, device, antialias, align_corners):
         kwargs = dict(mode='bicubic', align_corners=align_corners, antialias=antialias)
         # test float scale factor up & downsampling
-        for scale_factor in [0.5, 1, 1.5, 2]:
+        # for scale_factor in [0.5, 1, 1.5, 2]:
+        for scale_factor in [2, ]:
             in_t = torch.ones(2, 3, 8, 8, device=device)
+            print("dtype: ", in_t.dtype)
             out_t = F.interpolate(in_t, scale_factor=scale_factor, **kwargs)
+            print(out_t)
             out_size = int(math.floor(in_t.shape[-1] * scale_factor))
             expected_out = torch.ones(2, 3, out_size, out_size, device=device)
             self.assertEqual(expected_out, out_t, atol=1e-5, rtol=0)
@@ -15537,8 +15540,8 @@ class TestNNDeviceType(NNTestCase):
                 nondet_tol = 1e-5
             else:
                 nondet_tol = 0.0
-            input = torch.ones(2, 3, 8, 8, requires_grad=True, device=device)
-            gradcheck(lambda x: F.interpolate(x, out_size, **kwargs), [input], nondet_tol=nondet_tol)
+            inpt = torch.ones(2, 3, 8, 8, requires_grad=True, device=device)
+            gradcheck(lambda x: F.interpolate(x, out_size, **kwargs), [inpt], nondet_tol=nondet_tol)
 
     def test_upsamplingBicubic2d_correctness(self, device):
         # test output against known input: align_corners=False result must match opencv

@@ -459,7 +459,7 @@ static void upsample_bilinear2d_backward_out_cuda_template(
 
 // Code for upsampling with antialias
 template <typename scalar_t, typename accscalar_t, int interp_size>
-C10_LAUNCH_BOUNDS_1(1024)
+C10_LAUNCH_BOUNDS_1(1024) // 256 performs better then 1024
 __global__ void upsample_gen2d_aa_out_frame(
     const accscalar_t height_scale,
     const accscalar_t width_scale,
@@ -481,24 +481,22 @@ __global__ void upsample_gen2d_aa_out_frame(
     return;
   }
 
+  const accscalar_t half = 0.5;
   const accscalar_t support_h = static_cast<accscalar_t>(
-      (height_scale >= 1.0) ? (interp_size * 0.5) * height_scale : interp_size * 0.5);
+      (height_scale >= 1.0) ? (interp_size * half) * height_scale : interp_size * half);
   const accscalar_t support_w = static_cast<accscalar_t>(
-      (width_scale >= 1.0) ? (interp_size * 0.5) * width_scale : interp_size * 0.5);
+      (width_scale >= 1.0) ? (interp_size * half) * width_scale : interp_size * half);
 
   const int interp_height = (int)ceilf(support_h) * 2 + 1;
   const int interp_width = (int)ceilf(support_w) * 2 + 1;
 
-  // Setup weights using shared memory
+  // Setup weights and a buffer using shared memory
   extern __shared__ int smem[];
-  scalar_t *wx = reinterpret_cast<scalar_t*>(smem);
-  scalar_t *wy = reinterpret_cast<scalar_t*>(smem);
-  scalar_t *buffer2 = reinterpret_cast<scalar_t*>(smem);
-  // split wx, wy, buffer2
-  wx = &wx[interp_width * threadIdx.x];
-  wy = &wy[interp_width * blockDim.x + interp_height * threadIdx.y];
+  scalar_t* wx = reinterpret_cast<scalar_t*>(smem) + interp_width * threadIdx.x;
+  scalar_t* wy = reinterpret_cast<scalar_t*>(smem) + interp_width * blockDim.x + interp_height * threadIdx.y;
   const int offset = interp_width * blockDim.x + interp_height * blockDim.y;
-  buffer2 = &buffer2[offset + interp_height * (threadIdx.x + threadIdx.y * blockDim.x)];
+  scalar_t *buffer2 = reinterpret_cast<scalar_t*>(smem) + offset + \
+      interp_height * (threadIdx.x + threadIdx.y * blockDim.x);
 
   // Compute weights and kernel spans
   int xmin, xsize, ymin, ysize;
@@ -562,7 +560,7 @@ __global__ void upsample_gen2d_aa_out_frame(
 
 // Code for upsampling with antialias
 template <typename scalar_t, typename accscalar_t, int interp_size>
-C10_LAUNCH_BOUNDS_1(1024)
+C10_LAUNCH_BOUNDS_1(256) // 256 performs better then 1024
 __global__ void upsample_gen2d_aa_backward_out_frame(
     const accscalar_t height_scale,
     const accscalar_t width_scale,
@@ -607,11 +605,8 @@ __global__ void upsample_gen2d_aa_backward_out_frame(
 
   // Setup weights using shared memory
   extern __shared__ int smem[];
-  scalar_t *wx = reinterpret_cast<scalar_t*>(smem);
-  scalar_t *wy = reinterpret_cast<scalar_t*>(smem);
-  // split wx, wy
-  wx = &wx[interp_width * threadIdx.x];
-  wy = &wy[interp_width * blockDim.x + interp_height * threadIdx.y];
+  scalar_t* wx = reinterpret_cast<scalar_t*>(smem) + interp_width * threadIdx.x;
+  scalar_t* wy = reinterpret_cast<scalar_t*>(smem) + interp_width * blockDim.x + interp_height * threadIdx.y;
 
   // Compute weights and kernel spans
   int xmin, xsize, ymin, ysize;
@@ -675,6 +670,9 @@ __global__ void upsample_gen2d_aa_backward_out_frame(
   }
 }
 
+// In the code below interp_size distinguishes between bilinear and bicubic interpolations
+// interp_size = 2 <--> bilinear
+// interp_size = 4 <--> bicubic
 template <int interp_size>
 static void upsample_gen2d_aa_out_cuda_template(
     const Tensor& output,
@@ -694,10 +692,14 @@ static void upsample_gen2d_aa_out_cuda_template(
   int input_height = input.size(2);
   int input_width = input.size(3);
 
+  printf("out: %d, %d\n", output_height, output_width);
+  printf("in: %d, %d\n", input_height, input_width);
+  printf("1 scales: %f, %f\n", (scales_h ? *scales_h : -1.0), (scales_w ? *scales_w : -1.0));
+
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   size_t sharedMemPerBlock = at::cuda::getCurrentDeviceProperties()->sharedMemPerBlock;
   int* maxThreadsDim = at::cuda::getCurrentDeviceProperties()->maxThreadsDim;
-  int maxThreadsPerBlock = at::cuda::getCurrentDeviceProperties()->maxThreadsPerBlock;
+  int maxThreadsPerBlock = std::min(at::cuda::getCurrentDeviceProperties()->maxThreadsPerBlock, 1024);
   int* maxGridSize = at::cuda::getCurrentDeviceProperties()->maxGridSize;
   int block_x = std::min<int>(maxThreadsDim[0], at::cuda::warp_size());
   int grid_x = std::min<int>(maxGridSize[0], ceil_div(output_width, block_x));
@@ -721,16 +723,19 @@ static void upsample_gen2d_aa_out_cuda_template(
         //  (width_scale * interp_size + 3) * block_x +   <-- wx allocation
         //  (height_scale * interp_size + 3) * block_y * (block_x + 1)   <-- wy and buffer allocations
         // Note: scale * interp_size + 3 is an approximation for ceil( interp_size * 0.5 * scale ) * 2 + 1
-        // See definition of interp_height or interp_width inside the kernel
+        // See definitions of interp_height or interp_width inside the kernel
 
-        int numer = (sharedMemPerBlock * 1.0 / sizeof(scalar_t) - (width_scale * interp_size + 3) * block_x);
+        int numer = sharedMemPerBlock * 1.0 / sizeof(scalar_t) - (width_scale * interp_size + 3) * block_x;
         int denom = (height_scale * interp_size + 3) * (block_x + 1);
         int block_y = lastPow2((unsigned int) (numer / denom));
         block_y = std::min<int>(maxThreadsPerBlock / block_x, block_y);
+        printf("2 scales: %f, %f, %d\n", width_scale, height_scale, interp_size);  // 0.466667, 0.466667, 4
+        printf("block: %d, %d\n", block_x, block_y);
         const dim3 block(block_x, block_y);
 
         int grid_y = std::min<int>(maxGridSize[1], ceil_div(output_height, block_y));
         const dim3 grid(grid_x, grid_y);
+        printf("grid: %d, %d\n", grid_x, grid_y);
 
         // Compute actual size of required shared memory and verify if we can allocate it
         // - wx and wy size:
@@ -743,6 +748,8 @@ static void upsample_gen2d_aa_out_cuda_template(
             shmem_size <= sharedMemPerBlock,
             "Too much shared memory required: ", shmem_size, " vs ", sharedMemPerBlock);
 
+        printf("shmem_size: %d\n", (int) shmem_size);
+
         upsample_gen2d_aa_out_frame<scalar_t, accscalar_t, interp_size>
             <<<grid,
                block,
@@ -752,6 +759,9 @@ static void upsample_gen2d_aa_out_cuda_template(
       });
 }
 
+// In the code below interp_size distinguishes between bilinear and bicubic interpolations
+// interp_size = 2 <--> bilinear
+// interp_size = 4 <--> bicubic
 template <int interp_size>
 static void upsample_gen2d_aa_backward_out_cuda_template(
     const Tensor& grad_input,
@@ -780,8 +790,7 @@ static void upsample_gen2d_aa_backward_out_cuda_template(
 
   grad_input.zero_();
 
-  const int num_threads = std::min(
-      at::cuda::getCurrentDeviceProperties()->maxThreadsPerBlock, 1024);
+  const int num_threads = std::min(at::cuda::getCurrentDeviceProperties()->maxThreadsPerBlock, 256);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   int* maxThreadsDim = at::cuda::getCurrentDeviceProperties()->maxThreadsDim;
