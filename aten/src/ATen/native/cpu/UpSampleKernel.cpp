@@ -257,112 +257,151 @@ static inline void basic_loop(char** data, const int64_t* strides, int64_t n) {
 }
 
 template <typename scalar_t>
-static inline void basic_loop_aa_single_dim_zero_strides(
+static inline void basic_loop2d_aa_single_dim_zero_strides(
     char** data,
     const int64_t* strides,
-    int64_t n,
+    int64_t size0,
+    int64_t size1,
     unsigned int weights_precision) {
-  char* dst = data[0];
-  char* src = data[1];
-  // index stride is constant for the given dimension
-  const int64_t ids_stride = *(int64_t*)&data[2 + 2][0];
 
-  for (const auto i : c10::irange(n)) {
-    *(scalar_t*)&dst[i * strides[0]] =
-        interpolate_aa_single_dim_zero_strides<scalar_t, int64_t>(
-            src + i * strides[1], &data[2], ids_stride);
+  constexpr int ntensor = 2 + (3 + 2);  // output, input, idx_min, idx_size, idx_stride, w, w_idx
+  const int64_t* outer_strides = &strides[ntensor];
+
+  for (const auto j : c10::irange(size1)) {
+
+    if (j > 0) {
+      for (const auto arg : c10::irange(ntensor)) {
+        data[arg] += outer_strides[arg];
+      }
+    }
+    char* dst = data[0];
+    char* src = data[1];
+
+    // index stride is constant for the given dimension
+    const int64_t ids_stride = *(int64_t*)&data[2 + 2][0];
+
+    for (const auto i : c10::irange(size0)) {
+      *(scalar_t*)&dst[i * strides[0]] =
+          interpolate_aa_single_dim_zero_strides<scalar_t, int64_t>(
+              src + i * strides[1], &data[2], ids_stride);
+    }
   }
 }
 
 template <>
-inline void basic_loop_aa_single_dim_zero_strides<uint8_t>(
+inline void basic_loop2d_aa_single_dim_zero_strides<uint8_t>(
     char** data,
     const int64_t* strides,
-    int64_t n,
+    int64_t size0,
+    int64_t size1,
     unsigned int weights_precision) {
-  char* dst = data[0];
-  char* src = data[1];
-  // index stride is constant for the given dimension
-  const int64_t ids_stride = *(int64_t*)&data[2 + 2][0];
 
-  int64_t i = 0;
+  constexpr int ntensor = 2 + (3 + 2);  // output, input, idx_min, idx_size, idx_stride, w, w_idx
+  const int64_t* outer_strides = &strides[ntensor];
+
+  for (const auto j : c10::irange(size1)) {
+
+    if (j > 0) {
+      for (const auto arg : c10::irange(ntensor)) {
+        data[arg] += outer_strides[arg];
+      }
+    }
+    char* dst = data[0];
+    char* src = data[1];
+
+    // index stride is constant for the given dimension
+    const int64_t ids_stride = *(int64_t*)&data[2 + 2][0];
+
+    int64_t i = 0;
 
 #ifdef CPU_CAPABILITY_AVX2
 
 
 #endif
 
-  for (; i<n; i++) {
+    for (; i<size0; i++) {
+      const int64_t ids_min = *(int64_t*)&data[2 + 0][0];
+      const int64_t ids_size = *(int64_t*)&data[2 + 1][0];
 
-    const int64_t ids_min = *(int64_t*)&data[2 + 0][0];
-    const int64_t ids_size = *(int64_t*)&data[2 + 1][0];
+      char* src_min = src + i * strides[1] + ids_min;
 
-    char* src_min = src + i * strides[1] + ids_min;
+      uint8_t t = *(uint8_t*)&src_min[0];
+      int64_t wts_idx = *(int64_t*)&data[2 + 4][0];
+      short* wts_ptr = (short*)&data[2 + 3][wts_idx];
+      short wts = wts_ptr[0];
 
-    uint8_t t = *(uint8_t*)&src_min[0];
-    int64_t wts_idx = *(int64_t*)&data[2 + 4][0];
-    short* wts_ptr = (short*)&data[2 + 3][wts_idx];
-    short wts = wts_ptr[0];
-
-    // Intermediate computations are using integer type
-    int output = 1 << (weights_precision - 1);
-    output += t * wts;
-    for (const auto j : c10::irange(1, ids_size)) {
-      wts = wts_ptr[j];
-      t = *(uint8_t*)&src_min[j * ids_stride];
+      // Intermediate computations are using integer type
+      int output = 1 << (weights_precision - 1);
       output += t * wts;
-    }
-    output = (uint8_t) (output >> weights_precision);
+      for (const auto j : c10::irange(1, ids_size)) {
+        wts = wts_ptr[j];
+        t = *(uint8_t*)&src_min[j * ids_stride];
+        output += t * wts;
+      }
+      output = (uint8_t) (output >> weights_precision);
 
-    *(uint8_t*)&dst[i * strides[0]] = output;
-    //     interpolate_aa_single_dim_zero_strides<scalar_t, int64_t>(
-    //         src + i * strides[1], &data[2], ids_stride);
+      *(uint8_t*)&dst[i * strides[0]] = output;
+    }
   }
 }
 
 template <typename scalar_t>
-static inline void basic_loop_aa_single_dim_nonzero_strides(
+static inline void basic_loop2d_aa_single_dim_nonzero_strides(
     char** data,
     const int64_t* strides,
-    int64_t n,
+    int64_t size0,
+    int64_t size1,
     unsigned int weights_precision) {
-  char* dst = data[0];
-  char* src = data[1];
-  // index stride is constant for the given dimension
-  const int64_t ids_stride = *(int64_t*)&data[2 + 2][0];
 
-  if (strides[1] == 0) {
-    for (const auto i : c10::irange(n)) {
-      *(scalar_t*)&dst[i * strides[0]] =
-          interpolate_aa_single_dim<scalar_t, int64_t>(
-              src, &data[2], &strides[2], i, ids_stride);
+  constexpr int ntensor = 2 + (3 + 2);  // output, input, idx_min, idx_size, idx_stride, w, w_idx
+  const int64_t* outer_strides = &strides[ntensor];
+
+  for (const auto j : c10::irange(size1)) {
+
+    if (j > 0) {
+      for (const auto arg : c10::irange(ntensor)) {
+        data[arg] += outer_strides[arg];
+      }
     }
-  } else {
-    for (const auto i : c10::irange(n)) {
-      *(scalar_t*)&dst[i * strides[0]] =
-          interpolate_aa_single_dim<scalar_t, int64_t>(
-              src + i * strides[1], &data[2], &strides[2], i, ids_stride);
+
+    char* dst = data[0];
+    char* src = data[1];
+    // index stride is constant for the given dimension
+    const int64_t ids_stride = *(int64_t*)&data[2 + 2][0];
+
+    if (strides[1] == 0) {
+      for (const auto i : c10::irange(size0)) {
+        *(scalar_t*)&dst[i * strides[0]] =
+            interpolate_aa_single_dim<scalar_t, int64_t>(
+                src, &data[2], &strides[2], i, ids_stride);
+      }
+    } else {
+      for (const auto i : c10::irange(size0)) {
+        *(scalar_t*)&dst[i * strides[0]] =
+            interpolate_aa_single_dim<scalar_t, int64_t>(
+                src + i * strides[1], &data[2], &strides[2], i, ids_stride);
+      }
     }
   }
 }
 
 // #define VERBOSE
 
-template <>
-inline void basic_loop_aa_single_dim_nonzero_strides<uint8_t>(
+inline void basic_loop_aa_single_dim_nonzero_strides_uint8(
     char** data,
     const int64_t* strides,
     int64_t n,
-    unsigned int weights_precision) {
-  char* dst = data[0];
-  char* src = data[1];
-  // index stride is constant for the given dimension
-  const int64_t ids_stride = *(int64_t*)&data[2 + 2][0];
+    unsigned int weights_precision
+) {
+    char* dst = data[0];
+    char* src = data[1];
+    // index stride is constant for the given dimension
+    const int64_t ids_stride = *(int64_t*)&data[2 + 2][0];
 
-  int64_t i = 0;
+    int64_t i = 0;
 
-  // Here we are implementing data interpolation within the same line (vs between the lines)
-  // output[x, y] = input[xmin[x], y] * W[x] + input[xmin[x] + 1, y] * W[x + 1] + ... + input[xmin[x] + xsize, y] * W[x + xsize]
+    // Here we are implementing data interpolation within the same line (aka horizontal sampling)
+    // output[x, y] = input[xmin[x], y] * W[x] + input[xmin[x] + 1, y] * W[x + 1] + ... + input[xmin[x] + xsize, y] * W[x + xsize]
 
 #ifdef CPU_CAPABILITY_AVX2
 
@@ -371,58 +410,86 @@ inline void basic_loop_aa_single_dim_nonzero_strides<uint8_t>(
 
 #endif
 
-  for (; i<n; i++) {
+    for (; i<n; i++) {
 
-    int64_t ids_min = *(int64_t*)&data[2 + 0][i * strides[2 + 0]];
-    int64_t ids_size = *(int64_t*)&data[2 + 1][i * strides[2 + 1]];
+      int64_t ids_min = *(int64_t*)&data[2 + 0][i * strides[2 + 0]];
+      int64_t ids_size = *(int64_t*)&data[2 + 1][i * strides[2 + 1]];
 
-    char* src_min = src + i * strides[1] + ids_min;
+      char* src_min = src + i * strides[1] + ids_min;
 
-    uint8_t t = *(uint8_t*)&src_min[0];
-    int64_t wts_idx = *(int64_t*)&data[2 + 4][i * strides[2 + 4]];
-    short* wts_ptr = (short*)&data[2 + 3][wts_idx];
-    short wts = wts_ptr[0];
+      uint8_t t = *(uint8_t*)&src_min[0];
+      int64_t wts_idx = *(int64_t*)&data[2 + 4][i * strides[2 + 4]];
+      short* wts_ptr = (short*)&data[2 + 3][wts_idx];
+      short wts = wts_ptr[0];
 
-#ifdef VERBOSE
-    if (i < 2) {
-      std::cout << "\n-- i=" << i << ", n=" << n << std::endl;
-      std::cout << "t, wts: " << (int) t << ", " << wts << std::endl;
-    }
-#endif
-
-    // Intermediate computations are using integer type
-    int output = 1 << (weights_precision - 1);
-#ifdef VERBOSE
-    if (i < 2) {
-      std::cout << "1 output= " << output << std::endl;
-    }
-#endif
-    output += t * wts;
-#ifdef VERBOSE
-    if (i < 2) {
-      std::cout << "2 output= " << output << std::endl;
-    }
-#endif
-    for (const auto j : c10::irange(1, ids_size)) {
-      wts = wts_ptr[j];
-      t = *(uint8_t*)&src_min[j * ids_stride];
-      output += t * wts;
-#ifdef VERBOSE
+  #ifdef VERBOSE
       if (i < 2) {
-        std::cout << j + 2 << " t, wts, output= " << (int) t << ", " << wts << ", " << output << std::endl;
+        std::cout << "\n-- i=" << i << ", n=" << n << std::endl;
+        std::cout << "t, wts: " << (int) t << ", " << wts << std::endl;
       }
-#endif
-    }
-    output = (uint8_t) (output >> weights_precision);
-#ifdef VERBOSE
-    if (i < 2) {
-      std::cout << "final output= " << output << std::endl;
-    }
-#endif
+  #endif
 
-    *(uint8_t*)&dst[i * strides[0]] = output;
-        // interpolate_aa_single_dim<uint8_t,q int64_t>(
-        //     src + i * strides[1], &data[2], &strides[2], i, ids_stride);
+      // Intermediate computations are using integer type
+      int output = 1 << (weights_precision - 1);
+  #ifdef VERBOSE
+      if (i < 2) {
+        std::cout << "1 output= " << output << std::endl;
+      }
+  #endif
+      output += t * wts;
+  #ifdef VERBOSE
+      if (i < 2) {
+        std::cout << "2 output= " << output << std::endl;
+      }
+  #endif
+      for (const auto j : c10::irange(1, ids_size)) {
+        wts = wts_ptr[j];
+        t = *(uint8_t*)&src_min[j * ids_stride];
+        output += t * wts;
+  #ifdef VERBOSE
+        if (i < 2) {
+          std::cout << j + 2 << " t, wts, output= " << (int) t << ", " << wts << ", " << output << std::endl;
+        }
+  #endif
+      }
+      output = (uint8_t) (output >> weights_precision);
+  #ifdef VERBOSE
+      if (i < 2) {
+        std::cout << "final output= " << output << std::endl;
+      }
+  #endif
+
+      *(uint8_t*)&dst[i * strides[0]] = output;
+    }
+
+}
+
+
+template <>
+inline void basic_loop2d_aa_single_dim_nonzero_strides<uint8_t>(
+    char** data,
+    const int64_t* strides,
+    int64_t size0,
+    int64_t size1,
+    unsigned int weights_precision) {
+
+  #ifdef VERBOSE
+    std::cout << "basic_loop2d_aa_single_dim_nonzero_strides: size0=" << size0 << ", size1=" << size1 << std::endl;
+  #endif
+
+  constexpr int ntensor = 2 + (3 + 2);  // output, input, idx_min, idx_size, idx_stride, w, w_idx
+  const int64_t* outer_strides = &strides[ntensor];
+
+  for (const auto j : c10::irange(size1)) {
+
+    if (j > 0) {
+      for (const auto arg : c10::irange(ntensor)) {
+        data[arg] += outer_strides[arg];
+      }
+    }
+
+    basic_loop_aa_single_dim_nonzero_strides_uint8(data, strides, size0, weights_precision);
+
   }
 }
 
@@ -1513,11 +1580,12 @@ void upsample_generic_Nd_kernel_impl(
 template <typename scalar_t, bool is_horizontal>
 void cpu_upsample_generic_aa(at::TensorIterator& iter, unsigned int weights_precision) {
 
-  auto loop = [&](char** data, const int64_t* strides, int64_t n) {
+  auto loop2d = [&](char** data, const int64_t* strides, int64_t size0, int64_t size1) {
 
 #ifdef VERBOSE
-    if (TI_SHOW_STRIDES) {
-      std::cout << "AA TI_SHOW: N=" << n << std::endl;
+    if (true) {
+      std::cout << "TI_SHOW: size0=" << size0 << std::endl;
+      std::cout << "TI_SHOW: size1=" << size1 << std::endl;
       std::cout << "AA TI_SHOW_STRIDES: "
         << strides[0] << " "
         << strides[1] << " | ";
@@ -1525,8 +1593,8 @@ void cpu_upsample_generic_aa(at::TensorIterator& iter, unsigned int weights_prec
       constexpr int m = 3 + 2;
       int ndims = 1;
       for (int i=0; i<ndims; i++) {
-        for (int j=0; j<m; j++) {
-          std::cout << strides[m * i + j + 2] << " ";
+        for (int j=0; j<2 * m; j++) {
+          std::cout << strides[2 * m * i + j + 2] << " ";
         }
         std::cout << "| ";
       }
@@ -1541,8 +1609,8 @@ void cpu_upsample_generic_aa(at::TensorIterator& iter, unsigned int weights_prec
 #endif
       // Strides are : X 0 | 8 8 8 0 8
       // upsampling data within a contiguous dimension (aka horizontal resampling)
-      basic_loop_aa_single_dim_nonzero_strides<scalar_t>(
-          data, strides, n, weights_precision);
+      basic_loop2d_aa_single_dim_nonzero_strides<scalar_t>(
+          data, strides, size0, size1, weights_precision);
 
     } else {
 #ifdef VERBOSE
@@ -1550,12 +1618,12 @@ void cpu_upsample_generic_aa(at::TensorIterator& iter, unsigned int weights_prec
 #endif
       // Strides are : X Y | 0 0 0 0 0
       // upsampling data between contiguous dimensions (aka vertical resampling)
-      basic_loop_aa_single_dim_zero_strides<scalar_t>(
-          data, strides, n, weights_precision);
+      basic_loop2d_aa_single_dim_zero_strides<scalar_t>(
+          data, strides, size0, size1, weights_precision);
     }
   };
 
-  iter.for_each(loop);
+  iter.for_each(loop2d);
 }
 
 // Generic separable upsampling interpolation kernels for N-d case with anti-aliasing
