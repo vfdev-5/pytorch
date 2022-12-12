@@ -1,4 +1,6 @@
 #pragma once
+
+// #define CPU_CAPABILITY_AVX2
 #ifdef CPU_CAPABILITY_AVX2
 
 #include <ATen/core/Tensor.h>
@@ -7,6 +9,12 @@
 
 #include <stdio.h> // TODO: remove
 #include <iostream> // TODO: remove
+
+
+using namespace c10;
+using namespace at;
+using namespace at::native;
+using namespace at::indexing;
 
 namespace {
 
@@ -259,6 +267,100 @@ void ImagingResampleHorizontal_8bpc(
   }
 }
 
+
+void ImagingResampleHorizontal_8bpc_2(
+    uint32_t* unpacked_output_p,
+    uint32_t* unpacked_input_p,
+    std::vector<Tensor> horiz_indices_weights,
+    int xout,
+    int yout,
+    int xin,
+    unsigned int horiz_weights_precision) {
+  int xx, yy, x, xmin, xmax;
+  int16_t *kk;
+  int coefs_precision = horiz_weights_precision;
+
+  kk = (int16_t*) (horiz_indices_weights[3].data_ptr<double>());
+
+  int offset = 0;
+  int ksize = horiz_indices_weights[4].size(3) / xout;
+
+  std::vector<int> bounds_vec(2 * xout, 0);
+  int* bounds = bounds_vec.data();
+  {
+    int64_t* idx_ptr_xmin = horiz_indices_weights[0].data_ptr<int64_t>();
+    int64_t* idx_ptr_size = horiz_indices_weights[1].data_ptr<int64_t>();
+    for (int i=0; i<xout; i++) {
+      bounds[2 * i + 0] = idx_ptr_xmin[i];
+      bounds[2 * i + 1] = idx_ptr_size[i];
+    }
+  }
+
+  yy = 0;
+  for (; yy < yout - 3; yy += 4) {
+    ImagingResampleHorizontalConvolution8u4x(
+        unpacked_output_p + yy * xout,
+        unpacked_output_p + (yy + 1) * xout,
+        unpacked_output_p + (yy + 2) * xout,
+        unpacked_output_p + (yy + 3) * xout,
+        unpacked_input_p + (yy + offset) * xin,
+        unpacked_input_p + (yy + offset + 1) * xin,
+        unpacked_input_p + (yy + offset + 2) * xin,
+        unpacked_input_p + (yy + offset + 3) * xin,
+        xout,
+        bounds,
+        kk,
+        ksize,
+        coefs_precision);
+  }
+  for (; yy < yout; yy++) {
+    ImagingResampleHorizontalConvolution8u(
+        unpacked_output_p + yy * xout,
+        unpacked_input_p + (yy + offset) * xin,
+        xout,
+        bounds,
+        kk,
+        ksize,
+        coefs_precision);
+  }
+}
+
+void ImagingResampleVertical_8bpc_2(
+    uint32_t* unpacked_output_p,
+    uint32_t* unpacked_input_p,
+    std::vector<Tensor> vert_indices_weights,
+    int xout,
+    int yout,
+    unsigned int vert_weights_precision) {
+  int ymin, ymax;
+  int16_t *k, *kk;
+  int coefs_precision = vert_weights_precision;
+
+  kk = (int16_t*) (vert_indices_weights[3].data_ptr<double>());
+
+  int ksize = vert_indices_weights[4].size(3) / xout;
+
+  for (const auto yy : c10::irange(yout)) {
+    k = &kk[yy * ksize];
+    // ymin = bounds[yy * 2 + 0];
+    // ymax = bounds[yy * 2 + 1];
+    int64_t* idx_ptr_xmin = vert_indices_weights[0].data_ptr<int64_t>();
+    int64_t* idx_ptr_size = vert_indices_weights[1].data_ptr<int64_t>();
+
+    ymin = idx_ptr_xmin[yy];
+    ymax = idx_ptr_size[yy];
+
+    ImagingResampleVerticalConvolution8u(
+        unpacked_output_p + yy * xout,
+        unpacked_input_p,
+        ymin,
+        ymax,
+        k,
+        coefs_precision,
+        xout);
+  }
+}
+
 void ImagingResampleVertical_8bpc(
     uint32_t* unpacked_output_p,
     uint32_t* unpacked_input_p,
@@ -288,6 +390,73 @@ void ImagingResampleVertical_8bpc(
         coefs_precision,
         xout);
   }
+}
+
+template <typename scale_type, class F>
+uint32_t* ImagingResampleInner2(
+    uint32_t* unpacked_input_p,
+    int xin,
+    int yin,
+    int xout,
+    int yout,
+    bool align_corners,
+    const scale_type& scales) {
+
+  int i, need_horizontal, need_vertical;
+  int ybox_first, ybox_last;
+  int ksize_horiz, ksize_vert;
+  int *bounds_horiz, *bounds_vert;
+  double *kk_horiz, *kk_vert;
+  uint32_t* unpacked_output_p = NULL;
+  uint32_t* unpacked_output_temp_p = NULL;
+
+  need_horizontal = xout != xin;
+  need_vertical = yout != yin;
+
+  unsigned int horiz_weights_precision = 0;
+  int interp_dim = 4 - 1;  // width dim
+
+  auto horiz_indices_weights = F::compute_indices_int16_weights_aa(
+        xin, xout, 1, 4, interp_dim, align_corners, scales[interp_dim - 2], horiz_weights_precision);
+
+  unsigned int vert_weights_precision = 0;
+  interp_dim = 4 - 2;  // height dim
+
+  auto vert_indices_weights = F::compute_indices_int16_weights_aa(
+        yin, yout, xin, 4, interp_dim, align_corners, scales[interp_dim - 2], vert_weights_precision);
+
+  /* two-pass resize, horizontal pass */
+  if (need_horizontal) {
+
+    unpacked_output_temp_p = (uint32_t*)malloc(sizeof(uint32_t) * xout * yin);
+    ImagingResampleHorizontal_8bpc_2(
+        unpacked_output_temp_p,
+        unpacked_input_p,
+        horiz_indices_weights,
+        xout,
+        yin,
+        xin,
+        horiz_weights_precision
+    );
+    unpacked_output_p = unpacked_input_p = unpacked_output_temp_p;
+  }
+
+  /* vertical pass */
+  if (need_vertical) {
+    // imOut = ImagingNewDirty(imIn->mode, imIn->xsize, ysize);
+    unpacked_output_p = (uint32_t*)malloc(sizeof(uint32_t) * xout * yout);
+    // if (imOut) {
+    ImagingResampleVertical_8bpc_2(
+        unpacked_output_p,
+        unpacked_input_p,
+        vert_indices_weights,
+        xout,
+        yout,
+        vert_weights_precision);
+    // }
+  }
+
+  return unpacked_output_p;
 }
 
 // TODO: Cleanup error checks (as in comments)
@@ -383,6 +552,41 @@ uint32_t* ImagingResampleInner(
   // }
 
   return unpacked_output_p;
+}
+
+template <typename scale_type, class F>
+void upsample_avx_bilinear_or_bicubic(
+    const at::Tensor& input,
+    const at::Tensor& output,
+    bool align_corners,
+    const scale_type& scales) {
+
+  auto batch_size = input.size(0);
+  auto xin = input.size(3);
+  auto yin = input.size(2);
+  auto xout = output.size(3);
+  auto yout = output.size(2);
+  auto num_pixels_input = xin * yin;
+
+  uint32_t* unpacked_input_p =
+      (uint32_t*)malloc(sizeof(uint32_t) * num_pixels_input);
+
+  for (const auto i : c10::irange(batch_size)) {
+    unpack_rgb(
+        (uint8_t*)unpacked_input_p,
+        input[i],
+        input.is_contiguous(at::MemoryFormat::ChannelsLast));
+
+    uint32_t* unpacked_output_p =
+        ImagingResampleInner2<scale_type, F>(
+            unpacked_input_p, xin, yin, xout, yout, align_corners, scales);
+
+    pack_rgb(
+        (const uint8_t*)unpacked_output_p,
+        output[i],
+        output.is_contiguous(at::MemoryFormat::ChannelsLast));
+  }
+  free(unpacked_input_p);
 }
 
 void upsample_avx_bilinear_or_bicubic(
@@ -602,7 +806,7 @@ void ImagingResampleHorizontalConvolution8u(
           -1,15, -1,11, -1,14, -1,10, -1,13, -1,9, -1,12, -1,8,
           -1,7, -1,3, -1,6, -1,2, -1,5, -1,1, -1,4, -1,0));
         mmk = _mm256_shuffle_epi8(ksource, _mm256_set_epi8(
-          7,6, 5,4, 7,6, 5,4, 7,6, 5,4, 7,6, 5,4, 
+          7,6, 5,4, 7,6, 5,4, 7,6, 5,4, 7,6, 5,4,
           3,2, 1,0, 3,2, 1,0, 3,2, 1,0, 3,2, 1,0));
         sss256 = _mm256_add_epi32(sss256, _mm256_madd_epi16(pix, mmk));
         // clang-format on
