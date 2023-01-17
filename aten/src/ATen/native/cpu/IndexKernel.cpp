@@ -529,8 +529,7 @@ void cpu_hflip_vec(at::TensorIterator& iter) {
 }
 
 
-template<int size0>
-int64_t vectorized_cpu_hflip_channels_last_i8(char * C10_RESTRICT *data, const int64_t size, const int64_t stride) {
+int64_t vectorized_cpu_hflip_channels_last(char * C10_RESTRICT *data, const int64_t size, const int64_t stride, const int64_t size0) {
 
   int64_t i = 0;
 #ifdef CPU_CAPABILITY_AVX2
@@ -568,9 +567,10 @@ int64_t vectorized_cpu_hflip_channels_last_i8(char * C10_RESTRICT *data, const i
 
     // Generate shuffle mask for N channels, N in [2, 8]
     char mdata[16] = {};
+    const auto size0_stride = size0 * stride;
     for (int k=0; k<16; k++) {
-      int j = k / size0 + 1;
-      int v = (j * size0 - 1) - (k % size0);
+      int j = k / size0_stride + 1;
+      int v = (j * size0_stride - 1) - (k % size0_stride);
       v = std::min(v, (int) 15);
       mdata[k] = v;
     }
@@ -586,9 +586,9 @@ int64_t vectorized_cpu_hflip_channels_last_i8(char * C10_RESTRICT *data, const i
       mdata[12], mdata[13], mdata[14], mdata[15] // second 128-bit lane
     );
 
-    const auto usable_vec_size = 2 * ((vec_size / 2) / size0);
-    const auto delta = vec_size - usable_vec_size * size0;
-    const auto usable_vec_stride = usable_vec_size * size0 * stride;
+    const auto usable_vec_size = 2 * ((vec_size / 2) / size0) * size0;
+    const auto delta = vec_size - usable_vec_size;
+    const auto usable_vec_stride = usable_vec_size * stride;
     const auto usable_vec_half_stride = usable_vec_stride / 2;
 
     __m256i data_vec, reversed_vec;
@@ -598,7 +598,7 @@ int64_t vectorized_cpu_hflip_channels_last_i8(char * C10_RESTRICT *data, const i
 
     output_ptr += (size0 - delta/2) * stride;
 
-    for (; i < size - vec_size; i += usable_vec_size * size0) {
+    for (; i < size - vec_size; i += usable_vec_size) {
 
       // load 256-bits by two 128-bits parts
       auto a0 = _mm_loadu_si128((__m128i *) input_ptr);
@@ -625,7 +625,7 @@ int64_t vectorized_cpu_hflip_channels_last_i8(char * C10_RESTRICT *data, const i
   return i;
 }
 
-void cpu_hflip_channels_last_i8_C(at::TensorIterator& iter) {
+void cpu_hflip_channels_last_C(at::TensorIterator& iter) {
 
   auto loop2d = [&](char** base, const int64_t *strides, int64_t size0, int64_t size1) {
 
@@ -637,7 +637,6 @@ void cpu_hflip_channels_last_i8_C(at::TensorIterator& iter) {
     const int64_t stride = strides[0];
 
     TORCH_INTERNAL_ASSERT(strides[0] == strides[1]);
-    TORCH_INTERNAL_ASSERT(stride == 1);
 
     auto c = -outer_strides[0];
     TORCH_INTERNAL_ASSERT(c == outer_strides[1]);
@@ -647,20 +646,8 @@ void cpu_hflip_channels_last_i8_C(at::TensorIterator& iter) {
 
     int64_t i = 0;
 
-    if (c == 2) {
-      i += vectorized_cpu_hflip_channels_last_i8<2>(data, size, stride);
-    } else if (c == 3) {
-      i += vectorized_cpu_hflip_channels_last_i8<3>(data, size, stride);
-    } else if (c == 4) {
-      i += vectorized_cpu_hflip_channels_last_i8<4>(data, size, stride);
-    } else if (c == 5) {
-      i += vectorized_cpu_hflip_channels_last_i8<5>(data, size, stride);
-    } else if (c == 6) {
-      i += vectorized_cpu_hflip_channels_last_i8<6>(data, size, stride);
-    } else if (c == 7) {
-      i += vectorized_cpu_hflip_channels_last_i8<7>(data, size, stride);
-    } else if (c == 8) {
-      i += vectorized_cpu_hflip_channels_last_i8<8>(data, size, stride);
+    if (c > 0 && c < 16) {  // Must fit in SSE register
+      i += vectorized_cpu_hflip_channels_last(data, size, stride, size0);
     }
 
     auto data_stride = size0 * stride;
@@ -753,10 +740,11 @@ void flip_kernel(TensorIterator& iter, const bool quantized) {
       // a) channels last hflip on (N, C, H, W) and dtype=kByte, C in [2, 8]
       // b) flip dim=-2 on (N, ..., M, C) and dtype=kByte, C in [2, 8]
       auto output_strides = iter.strides(0);
-      auto iter_dtype = iter.dtype();
+      auto input_strides = iter.strides(1);
       auto c = -output_strides[1];
-      if ((iter_dtype == at::kByte || iter_dtype == at::kChar) && (c >= 2 && c <= 8)) {
-        return cpu_hflip_channels_last_i8_C(iter);
+      if (c > 0 && c < 16 &&  // Must fit in an SSE register
+          c == input_strides[1]) {
+        return cpu_hflip_channels_last_C(iter);
       }
       // Special case: vertical flip using memcpy (faster than generic cpu_kernel_vec)
       return cpu_vflip_memcpy(iter);
