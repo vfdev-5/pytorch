@@ -271,8 +271,7 @@ void upsample_avx_bilinear(
             /*reshape_dim=*/interp_dim,
             /*align_corners=*/align_corners,
             /*opt_scale=*/scales[interp_dim - 2],
-            /*antialias=*/antialias,
-            /*align_i32=*/true);
+            /*antialias=*/antialias);
   }
 
   if (need_vertical) {
@@ -286,8 +285,7 @@ void upsample_avx_bilinear(
             /*reshape_dim=*/interp_dim,
             /*align_corners=*/align_corners,
             /*opt_scale=*/scales[interp_dim - 2],
-            /*antialias=*/antialias,
-            /*align_i32=*/true);
+            /*antialias=*/antialias);
   }
 
   at::Tensor unpacked_input;
@@ -337,6 +335,12 @@ void upsample_avx_bilinear(
   }
 }
 
+__m256i mm256_set2_epi16(int16_t v1, int16_t v2) {
+  return _mm256_set_epi16(
+      v2, v1, v2, v1, v2, v1, v2, v1,
+      v2, v1, v2, v1, v2, v1, v2, v1);
+}
+
 // https://gist.github.com/NicolasHug/47c97d731f05eaad5694c173849b86f5
 void ImagingResampleHorizontalConvolution8u4x(
     uint32_t* lineOut0,
@@ -370,8 +374,8 @@ void ImagingResampleHorizontalConvolution8u4x(
     for (; x < xmax - 3; x += 4) {
       __m256i pix, mmk0, mmk1, source;
 
-      mmk0 = _mm256_set1_epi32(*(int32_t*)&k[x]);
-      mmk1 = _mm256_set1_epi32(*(int32_t*)&k[x + 2]);
+      mmk0 = mm256_set2_epi16(k[x + 0], k[x + 1]);
+      mmk1 = mm256_set2_epi16(k[x + 2], k[x + 3]);
 
       source = _mm256_inserti128_si256(
           _mm256_castsi128_si256(_mm_loadu_si128((__m128i*)&lineIn0[x + xmin])),
@@ -404,7 +408,7 @@ void ImagingResampleHorizontalConvolution8u4x(
     for (; x < xmax - 1; x += 2) {
       __m256i pix, mmk;
 
-      mmk = _mm256_set1_epi32(*(int32_t*)&k[x]);
+      mmk = mm256_set2_epi16(k[x], k[x + 1]);
 
       pix = _mm256_inserti128_si256(
           _mm256_castsi128_si256(_mm_loadl_epi64((__m128i*)&lineIn0[x + xmin])),
@@ -457,6 +461,10 @@ void ImagingResampleHorizontalConvolution8u4x(
     lineOut2[xx] = _mm_cvtsi128_si32(_mm256_extracti128_si256(sss1, 0));
     lineOut3[xx] = _mm_cvtsi128_si32(_mm256_extracti128_si256(sss1, 1));
   }
+}
+
+__m128i mm_set2_epi16(int16_t v1, int16_t v2) {
+    return _mm_set_epi16(v2, v1, v2, v1, v2, v1, v2, v1);
 }
 
 // https://gist.github.com/NicolasHug/47c97d731f05eaad5694c173849b86f5
@@ -536,7 +544,7 @@ void ImagingResampleHorizontalConvolution8u(
     }
 
     for (; x < xmax - 1; x += 2) {
-      __m128i mmk = _mm_set1_epi32(*(int32_t*)&k[x]);
+      __m128i mmk = mm_set2_epi16(k[x], k[x + 1]);
       __m128i source = _mm_loadl_epi64((__m128i*)&lineIn[x + xmin]);
       __m128i pix = _mm_shuffle_epi8(
           source,
@@ -582,7 +590,7 @@ void ImagingResampleVerticalConvolution8u(
       __m256i pix, mmk;
 
       // Load two coefficients at once
-      mmk = _mm256_set1_epi32(*(int32_t*)&k[x]);
+      mmk = mm256_set2_epi16(k[x], k[x + 1]);
 
       // Load 2 lines
       //                           (__m256i *) &imIn->image32[x + xmin][xx]
@@ -642,7 +650,7 @@ void ImagingResampleVerticalConvolution8u(
       __m128i pix, mmk;
 
       // Load two coefficients at once
-      mmk = _mm_set1_epi32(*(int32_t*)&k[x]);
+      mmk = mm_set2_epi16(k[x], k[x + 1]);
 
       // Load 2 lines
       //                        (__m128i *) &imIn->image32[x + xmin][xx])
@@ -685,7 +693,7 @@ void ImagingResampleVerticalConvolution8u(
       __m128i pix, mmk;
 
       // Load two coefficients at once
-      mmk = _mm_set1_epi32(*(int32_t*)&k[x]);
+      mmk = mm_set2_epi16(k[x], k[x + 1]);
 
       // Load 2 lines
       //                           *(int *) &imIn->image32[x + xmin][xx]
