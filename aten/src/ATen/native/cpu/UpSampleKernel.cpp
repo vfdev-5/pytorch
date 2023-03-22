@@ -315,6 +315,27 @@ static inline void basic_loop_aa_vertical(
   }
 }
 
+// #define VERBOSE
+
+#ifdef CPU_CAPABILITY_AVX2
+
+static inline __m128i mm_cvt_si128(const uint8_t* C10_RESTRICT ptr, int n) {
+  int32_t v;
+  if (n == 2) {
+    std::memcpy(&v, ptr, n);
+  } else if (n == 3) {
+    std::memcpy(&v, ptr, n);
+  } else if (n == 4) {
+    std::memcpy(&v, ptr, n);
+  } else {
+    TORCH_INTERNAL_ASSERT(false);
+  }
+  return _mm_cvtsi32_si128(v);
+}
+
+#endif
+
+
 template <>
 inline void basic_loop_aa_vertical<uint8_t>(
     char** data,
@@ -330,22 +351,144 @@ inline void basic_loop_aa_vertical<uint8_t>(
   const int64_t ids_size = *(int64_t*)&data[2 + 1][0];
   const int64_t ids_min = *(int64_t*)&data[2 + 0][0];
 
+  printf("strides[0]: %ld, strides[1]: %ld\n", strides[0], strides[1]);
+  printf("ids_min: %ld, ids_size: %ld, ids_stride: %ld\n", ids_min, ids_size, ids_stride);
+
+  const int64_t wts_idx = *(int64_t*)&data[2 + 4][0];
+  const int16_t* wts_ptr = (int16_t*)&data[2 + 3][wts_idx];
+
   int64_t i = 0;
 
-  for (; i<n; i++) {
+#ifdef CPU_CAPABILITY_AVX2
+
+  const auto wts_mask_b4 = _mm_set_epi8(
+      3, 2, 3, 2, 3, 2, 3, 2, 1, 0, 1, 0, 1, 0, 1, 0);
+
+  TORCH_INTERNAL_ASSERT(strides[1] == sizeof(uint8_t));
+
+  const auto initial = _mm_set1_epi32(1 << (weights_precision - 1));
+  // const auto initial_256 = _mm256_set1_epi32(1 << (weights_precision - 1));
+  const auto zero = _mm_setzero_si128();
+  // const auto zero_256 = _mm256_setzero_si256();
+
+  // Block 8: Read 8 values from input
+  // for (; i < n - 7; i += 8) {
+  //   auto sss = initial;
+
+  //   int64_t j = 0;
+  //   char* src_min = src + i * strides[1] + ids_min;
+
+  //   // for (; j < ids_size - 1; j += 2) {
+  //   //   // wts = [
+  //   //   //    w0_l w0_h w1_l w1_h  w0_l w0_h w1_l w1_h
+  //   //   //    w0_l w0_h w1_l w1_h  w0_l w0_h w1_l w1_h
+  //   //   // ]
+  //   //   auto wts = _mm_set1_epi32(*(int32_t*)&wts_ptr[j]);
+
+  //   //   // Read 8 bytes, 4 bytes per line:
+  //   //   // source1 = [r0 r1 r2 r3  0 0 0 0  0 0 0 0  0 0 0 0]
+  //   //   // source2 = [R0 R1 R2 R3  0 0 0 0  0 0 0 0  0 0 0 0]
+  //   //   // source = [r0 R0 r1 R1  r2 R2 r3 R3  0 0 0 0  0 0 0 0]
+  //   //   // pix = [r0 0 R0 0  r1 0 R1 0  r2 0 R2 0  r3 0 R3 0]
+  //   //   auto source1 = mm_cvt_si128((const uint8_t *) &src_min[j * ids_stride], 4);
+  //   //   auto source2 = mm_cvt_si128((const uint8_t *) &src_min[(j + 1) * ids_stride], 4);
+  //   //   auto source = _mm_unpacklo_epi8(source1, source2);
+  //   //   auto pix = _mm_unpacklo_epi8(source, zero);
+  //   //   // sss = [
+  //   //   //    (r0 * w0) + (R0 * w1)   as int16
+  //   //   //    (r1 * w0) + (R1 * w1)   as int16
+  //   //   //    (r2 * w0) + (R2 * w1)   as int16
+  //   //   //    (r3 * w0) + (R3 * w1)   as int16
+  //   //   // ]
+  //   //   sss = _mm_add_epi32(sss, _mm_madd_epi16(pix, wts));
+  //   // }
+
+  //   for (; j < ids_size; j++) {
+  //     // wts = [w0_l w0_h w0_l w0_h  w0_l w0_h w0_l w0_h  ...]
+  //     auto wts = _mm_set1_epi32(wts_ptr[j]);
+  //     // Read 4 bytes:
+  //     // source = [r0 r1 r2 r3  r4 r5 r6 r7  0 0 0 0  0 0 0 0]
+  //     // pix = [r0 0 r1 0  r2 0 r3 0  r4 0 r5 0  r6 0 r7 0]
+  //     auto source = _mm_loadl_epi64((__m128i *) &src_min[j * ids_stride]);
+  //     auto pix = _mm_unpacklo_epi8(source, zero);
+  //     // sss = [(r0 * w0) (r1 * w0)  (r2 * w0) (r3 * w0)  (r4 * w0) (r5 * w0)  (r6 * w0) (r7 * w0)]
+  //     sss = _mm_add_epi32(sss, _mm_madd_epi16(pix, wts));
+  //   }
+  //   sss = _mm_srai_epi32(sss, weights_precision);
+  //   sss = _mm_packs_epi32(sss, zero);
+  //   sss = _mm_packus_epi16(sss, zero);
+  //   auto o = _mm_cvtsi128_si32(sss);
+
+  //   std::memcpy(&dst[i * strides[0]], (uint8_t *) &o, 4);
+  // }
+
+  // // Block 4: Read 4 values from input
+  // for (; i < n - 3; i += 4) {
+  //   auto sss = initial;
+
+  //   int64_t j = 0;
+  //   char* src_min = src + i * strides[1] + ids_min;
+
+  //   // for (; j < ids_size - 1; j += 2) {
+  //   //   // wts = [
+  //   //   //    w0_l w0_h w1_l w1_h  w0_l w0_h w1_l w1_h
+  //   //   //    w0_l w0_h w1_l w1_h  w0_l w0_h w1_l w1_h
+  //   //   // ]
+  //   //   auto wts = _mm_set1_epi32(*(int32_t*)&wts_ptr[j]);
+
+  //   //   // Read 8 bytes, 4 bytes per line:
+  //   //   // source1 = [r0 r1 r2 r3  0 0 0 0  0 0 0 0  0 0 0 0]
+  //   //   // source2 = [R0 R1 R2 R3  0 0 0 0  0 0 0 0  0 0 0 0]
+  //   //   // source = [r0 R0 r1 R1  r2 R2 r3 R3  0 0 0 0  0 0 0 0]
+  //   //   // pix = [r0 0 R0 0  r1 0 R1 0  r2 0 R2 0  r3 0 R3 0]
+  //   //   auto source1 = mm_cvt_si128((const uint8_t *) &src_min[j * ids_stride], 4);
+  //   //   auto source2 = mm_cvt_si128((const uint8_t *) &src_min[(j + 1) * ids_stride], 4);
+  //   //   auto source = _mm_unpacklo_epi8(source1, source2);
+  //   //   auto pix = _mm_unpacklo_epi8(source, zero);
+  //   //   // sss = [
+  //   //   //    (r0 * w0) + (R0 * w1)   as int16
+  //   //   //    (r1 * w0) + (R1 * w1)   as int16
+  //   //   //    (r2 * w0) + (R2 * w1)   as int16
+  //   //   //    (r3 * w0) + (R3 * w1)   as int16
+  //   //   // ]
+  //   //   sss = _mm_add_epi32(sss, _mm_madd_epi16(pix, wts));
+  //   // }
+
+  //   for (; j < ids_size; j++) {
+  //     // wts = [w0_l w0_h w0_l w0_h  w0_l w0_h w0_l w0_h  ...]
+  //     auto wts = _mm_set1_epi32(wts_ptr[j]);
+  //     // Read 4 bytes:
+  //     // source = [r0 r1 r2 r3  0 0 0 0  0 0 0 0  0 0 0 0]
+  //     // pix = [r0 0 r1 0  r2 0 r3 0  0 0 0 0  0 0 0 0]
+  //     auto source = mm_cvt_si128((const uint8_t *) &src_min[j * ids_stride], 4);
+  //     auto pix = _mm_unpacklo_epi8(source, zero);
+  //     // sss = [(r0 * w0) (r1 * w0)  (r2 * w0) (r3 * w0)  0 0 0 0  0 0 0 0]
+  //     sss = _mm_add_epi32(sss, _mm_madd_epi16(pix, wts));
+  //   }
+  //   sss = _mm_srai_epi32(sss, weights_precision);
+  //   sss = _mm_packs_epi32(sss, zero);
+  //   sss = _mm_packus_epi16(sss, zero);
+  //   auto o = _mm_cvtsi128_si32(sss);
+
+  //   std::memcpy(&dst[i * strides[0]], (uint8_t *) &o, 4);
+  // }
+
+#endif // CPU_CAPABILITY_AVX2
+
+  // Block 1
+  for (; i < n; i++) {
 
     char* src_min = src + i * strides[1] + ids_min;
 
     uint8_t t = *(uint8_t*)&src_min[0];
-    int64_t wts_idx = *(int64_t*)&data[2 + 4][0];
-    int16_t* wts_ptr = (int16_t*)&data[2 + 3][wts_idx];
     int16_t wts = wts_ptr[0];
-
+    printf("wts_ptr[0]: %d\n", (int) wts_ptr[0]);
     // Intermediate computations are using integer type
     int output = 1 << (weights_precision - 1);  // accounts for the +0.5 part
     output += t * wts;
     for (const auto j : c10::irange(1, ids_size)) {
       wts = wts_ptr[j];
+      printf("wts_ptr[j]: %d\n", (int) wts);
       t = *(uint8_t*)&src_min[j * ids_stride];
       output += t * wts;
     }
@@ -1407,6 +1550,28 @@ template <typename scalar_t, bool is_horizontal>
 void cpu_upsample_generic_aa(at::TensorIterator& iter, unsigned int weights_precision) {
 
   auto loop = [&](char** data, const int64_t* strides, int64_t n) {
+
+#ifdef VERBOSE
+    if (true) {
+      std::cout << "TI_SHOW: n=" << n << std::endl;
+      // std::cout << "TI_SHOW: size0=" << size0 << std::endl;
+      // std::cout << "TI_SHOW: size1=" << size1 << std::endl;
+      std::cout << "AA TI_SHOW_STRIDES: "
+        << strides[0] << " "
+        << strides[1] << " | ";
+
+      constexpr int m = 3 + 2;
+      int ndims = 1;
+      for (int i=0; i<ndims; i++) {
+        for (int j=0; j<2 * m; j++) {
+          std::cout << strides[2 * m * i + j + 2] << " ";
+        }
+        std::cout << "| ";
+      }
+      std::cout << std::endl;
+    }
+#endif
+
     if (is_horizontal) {
 
       // Strides are : X 0 | 8 8 8 0 8  (Channels first)
@@ -1422,8 +1587,10 @@ void cpu_upsample_generic_aa(at::TensorIterator& iter, unsigned int weights_prec
             data, strides, n, weights_precision);
       }
     } else {
-      // Strides are : X Y | 0 0 0 0 0 (Channels first)
+      // Strides are : X X | 0 0 0 0 0 (Channels first)
       // Strides are : X X | 0 0 0 0 0 (Channels last)
+      // n: output_width (Channels first)
+      // n: output_width * num_channels (Channels last)
       // upsampling data between contiguous dimensions (aka vertical resampling)
       if ((strides[0] == sizeof(scalar_t)) && (strides[1] == sizeof(scalar_t)) &&
           is_zero_stride<3 + 2>(&strides[2])) {
@@ -1756,7 +1923,7 @@ void upsample_bilinear2d_aa_kernel_impl(
     c10::optional<double> scales_h,
     c10::optional<double> scales_w) {
 #ifdef CPU_CAPABILITY_AVX2
-  if (input.dtype() == at::kByte && input.size(1) <= 4) {
+  if (input.dtype() == at::kByte && input.size(1) <= 4 && input.is_contiguous(at::MemoryFormat::ChannelsLast)) {
     upsample_avx_bilinear_uint8<scale_t, HelperInterpLinear>(
       input, output, align_corners, {scales_h, scales_w},
       /*antialias=*/true);
