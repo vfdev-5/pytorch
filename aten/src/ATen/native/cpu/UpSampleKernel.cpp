@@ -845,7 +845,7 @@ struct HelperInterpBase {
 
     scalar_t wt_max = 0.0;
     for (const auto i : c10::irange(output_size)) {
-      int64_t xmin, xmax;
+      int64_t xmin, xsize;
       auto wt_max_i = HelperInterpBase::_compute_weights_aa(
           i,
           input_size,
@@ -855,14 +855,14 @@ struct HelperInterpBase {
           max_interp_size,
           aa_filter_fn,
           xmin,
-          xmax,
+          xsize,
           antialias,
           align_corners_delta);
 
       wt_max = std::max(wt_max, wt_max_i);
 
       idx_ptr_xmin[i] = xmin * stride;
-      idx_ptr_size[i] = xmax;
+      idx_ptr_size[i] = xsize;
       idx_ptr_stride[i] = stride;
       wt_idx_ptr[i] = i * max_interp_size * weight_index_stride;
     }
@@ -1385,6 +1385,7 @@ void upsample_generic_Nd_kernel_impl(
   TensorIteratorConfig config;
   config.check_all_same_dtype(false)
     .declare_static_dtype_and_device(input.scalar_type(), input.device())
+    .resize_outputs(false)
     .add_output(output)
     .add_input(restrided_input);
 
@@ -1500,6 +1501,7 @@ void _separable_upsample_generic_Nd_kernel_impl_single_dim(
   TensorIteratorConfig config;
   config.check_all_same_dtype(false)
       .declare_static_dtype_and_device(input.scalar_type(), input.device())
+      .resize_outputs(false)
       .add_output(output)
       .add_input(restrided_input);
 
@@ -1556,7 +1558,20 @@ void separable_upsample_generic_Nd_kernel_impl(
     num_single_dim_ops -= 1;
     if (num_single_dim_ops > 0) {
       temp_oshape[interp_dim] = output_shape[interp_dim];
-      temp_output = at::empty(temp_oshape, input.options());
+
+      auto options = input.options();
+      // For bicubic case and input uint8 dtype we have to use int32 buffer dtype
+      if (F::interp_size == 4 && input.scalar_type() == at::kByte) {
+        options = options.dtype(at::kInt);
+      }
+
+      temp_output = at::empty(temp_oshape, options);
+
+      // We can remove that
+      if (F::interp_size == 4 && input.scalar_type() == at::kByte) {
+        TORCH_INTERNAL_ASSERT(temp_output.scalar_type() == at::kInt);
+      }
+
     } else {
       temp_output = output;
     }
@@ -1578,7 +1593,20 @@ void separable_upsample_generic_Nd_kernel_impl(
       num_single_dim_ops -= 1;
       if (num_single_dim_ops > 0) {
         temp_oshape[interp_dim] = output_shape[interp_dim];
-        temp_output = at::empty(temp_oshape, input.options());
+
+        auto options = temp_input.options();
+        // For bicubic case and input uint8 dtype we have to use int32 buffer dtype
+        if (F::interp_size == 4 && temp_input.scalar_type() == at::kByte) {
+          options = options.dtype(at::kInt);
+        }
+
+        temp_output = at::empty(temp_oshape, options);
+
+        // We can remove that
+        if (F::interp_size == 4 && temp_input.scalar_type() == at::kByte) {
+          TORCH_INTERNAL_ASSERT(temp_output.scalar_type() == at::kInt);
+        }
+
       } else {
         temp_output = output;
       }
@@ -1825,9 +1853,26 @@ void upsample_bicubic2d_aa_kernel_impl(
   TORCH_CHECK(input.scalar_type() != at::kByte,
       "'upsample_bicubic2d_aa_kernel_impl' not implemented for 'Byte'");
 
+  // if (input.dtype() == at::kByte) {
+  //   #ifdef CPU_CAPABILITY_AVX2
+  //     if (input.size(1) <= 4) {
+  //       upsample_avx_bilinear_uint8<scale_t, HelperInterpCubic>(
+  //         input, output, align_corners, {scales_h, scales_w},
+  //         /*antialias=*/true);
+  //     } else {
+  //       TORCH_CHECK(false, "upsample_bicubic2d_aa_kernel_impl is not implemented for kByte and C>4");
+  //     }
+  //   #else // CPU_CAPABILITY_AVX2
+  //   separable_upsample_generic_Nd_kernel_impl<2, scale_t, HelperInterpCubic>(
+  //       output, input, align_corners, {scales_h, scales_w},
+  //       /*antialias=*/true);
+  //   #endif // CPU_CAPABILITY_AVX2
+  // }
+
   separable_upsample_generic_Nd_kernel_impl<2, scale_t, HelperInterpCubic>(
-    output, input, align_corners, {scales_h, scales_w},
-    /*antialias=*/true);
+      output, input, align_corners, {scales_h, scales_w},
+      /*antialias=*/true);
+
 }
 
 template <
