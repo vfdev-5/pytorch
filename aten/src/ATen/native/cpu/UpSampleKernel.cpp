@@ -297,7 +297,8 @@ static inline void basic_loop(char** data, const int64_t* strides, int64_t n) {
   }
 }
 
-template <typename scalar_t>
+// Here input_scalar_t is unused and is assumed to be the same as scalar_t
+template <typename scalar_t, typename input_scalar_t>
 static inline void basic_loop_aa_vertical(
     char** data,
     const int64_t* strides,
@@ -315,8 +316,27 @@ static inline void basic_loop_aa_vertical(
   }
 }
 
+template <typename input_scalar_t>
+inline void basic_loop_step_aa(
+    int32_t & output,
+    char* src,
+    int16_t* wts_ptr,
+    int64_t ids_size,
+    int64_t ids_stride
+) {
+  input_scalar_t t = *(input_scalar_t*)&src[0];
+  int16_t wts = wts_ptr[0];
+
+  output += t * wts;
+  for (const auto j : c10::irange(1, ids_size)) {
+    wts = wts_ptr[j];
+    t = *(input_scalar_t*)&src[j * ids_stride];
+    output += t * wts;
+  }
+}
+
 template <>
-inline void basic_loop_aa_vertical<uint8_t>(
+inline void basic_loop_aa_vertical<uint8_t, int32_t>(
     char** data,
     const int64_t* strides,
     int64_t n,
@@ -333,27 +353,46 @@ inline void basic_loop_aa_vertical<uint8_t>(
   int64_t i = 0;
 
   for (; i<n; i++) {
-
     char* src_min = src + i * strides[1] + ids_min;
-
-    uint8_t t = *(uint8_t*)&src_min[0];
     int64_t wts_idx = *(int64_t*)&data[2 + 4][0];
     int16_t* wts_ptr = (int16_t*)&data[2 + 3][wts_idx];
-    int16_t wts = wts_ptr[0];
 
-    // Intermediate computations are using integer type
-    int output = 1 << (weights_precision - 1);  // accounts for the +0.5 part
-    output += t * wts;
-    for (const auto j : c10::irange(1, ids_size)) {
-      wts = wts_ptr[j];
-      t = *(uint8_t*)&src_min[j * ids_stride];
-      output += t * wts;
-    }
+    int32_t output = 1 << (weights_precision - 1);  // accounts for the +0.5 part
+    basic_loop_step_aa<int32_t>(output, src_min, wts_ptr, ids_size, ids_stride);
     *(uint8_t*)&dst[i * strides[0]] = (uint8_t)std::clamp(output >> weights_precision, 0, 255);
   }
 }
 
-template <typename scalar_t>
+template <>
+inline void basic_loop_aa_vertical<uint8_t, uint8_t>(
+    char** data,
+    const int64_t* strides,
+    int64_t n,
+    unsigned int weights_precision) {
+  // See Note [ Weights computation for uint8_t and multiplication trick ]
+  char* dst = data[0];
+  char* src = data[1];
+
+  // index stride is constant for the given dimension
+  const int64_t ids_stride = *(int64_t*)&data[2 + 2][0];
+  const int64_t ids_size = *(int64_t*)&data[2 + 1][0];
+  const int64_t ids_min = *(int64_t*)&data[2 + 0][0];
+
+  int64_t i = 0;
+
+  for (; i<n; i++) {
+    char* src_min = src + i * strides[1] + ids_min;
+    int64_t wts_idx = *(int64_t*)&data[2 + 4][0];
+    int16_t* wts_ptr = (int16_t*)&data[2 + 3][wts_idx];
+
+    int32_t output = 1 << (weights_precision - 1);  // accounts for the +0.5 part
+    basic_loop_step_aa<uint8_t>(output, src_min, wts_ptr, ids_size, ids_stride);
+    *(uint8_t*)&dst[i * strides[0]] = (uint8_t)std::clamp(output >> weights_precision, 0, 255);
+  }
+}
+
+// Here input_scalar_t is unused and is assumed to be the same as scalar_t
+template <typename scalar_t, typename input_scalar_t>
 static inline void basic_loop_aa_horizontal(
     char** data,
     const int64_t* strides,
@@ -380,7 +419,7 @@ static inline void basic_loop_aa_horizontal(
 }
 
 template <>
-inline void basic_loop_aa_horizontal<uint8_t>(
+inline void basic_loop_aa_horizontal<int32_t, uint8_t>(
     char** data,
     const int64_t* strides,
     int64_t n,
@@ -397,25 +436,45 @@ inline void basic_loop_aa_horizontal<uint8_t>(
   // output[x, y] = input[xmin[x], y] * W[x] + input[xmin[x] + 1, y] * W[x + 1] + ... + input[xmin[x] + xsize, y] * W[x + xsize]
 
   for (; i<n; i++) {
-
     int64_t ids_min = *(int64_t*)&data[2 + 0][i * strides[2 + 0]];
     int64_t ids_size = *(int64_t*)&data[2 + 1][i * strides[2 + 1]];
-
     char* src_min = src + i * strides[1] + ids_min;
-
-    uint8_t t = *(uint8_t*)&src_min[0];
     int64_t wts_idx = *(int64_t*)&data[2 + 4][i * strides[2 + 4]];
     int16_t* wts_ptr = (int16_t*)&data[2 + 3][wts_idx];
-    int16_t wts = wts_ptr[0];
+
+    int32_t output = 1 << (weights_precision - 1);  // accounts for the +0.5 part
+    basic_loop_step_aa<uint8_t>(output, src_min, wts_ptr, ids_size, ids_stride);
+    *(int32_t*)&dst[i * strides[0]] = output >> weights_precision;
+  }
+}
+
+template <>
+inline void basic_loop_aa_horizontal<uint8_t, uint8_t>(
+    char** data,
+    const int64_t* strides,
+    int64_t n,
+    unsigned int weights_precision) {
+  // See Note [ Weights computation for uint8_t and multiplication trick ]
+  char* dst = data[0];
+  char* src = data[1];
+  // index stride is constant for the given dimension
+  const int64_t ids_stride = *(int64_t*)&data[2 + 2][0];
+
+  int64_t i = 0;
+
+  // Here we are implementing data interpolation within the same line (vs between the lines)
+  // output[x, y] = input[xmin[x], y] * W[x] + input[xmin[x] + 1, y] * W[x + 1] + ... + input[xmin[x] + xsize, y] * W[x + xsize]
+
+  for (; i<n; i++) {
+    int64_t ids_min = *(int64_t*)&data[2 + 0][i * strides[2 + 0]];
+    int64_t ids_size = *(int64_t*)&data[2 + 1][i * strides[2 + 1]];
+    char* src_min = src + i * strides[1] + ids_min;
+    int64_t wts_idx = *(int64_t*)&data[2 + 4][i * strides[2 + 4]];
+    int16_t* wts_ptr = (int16_t*)&data[2 + 3][wts_idx];
 
     // Intermediate computations are using integer type
-    int output = 1 << (weights_precision - 1);  // accounts for the +0.5 part
-    output += t * wts;
-    for (const auto j : c10::irange(1, ids_size)) {
-      wts = wts_ptr[j];
-      t = *(uint8_t*)&src_min[j * ids_stride];
-      output += t * wts;
-    }
+    int32_t output = 1 << (weights_precision - 1);  // accounts for the +0.5 part
+    basic_loop_step_aa<uint8_t>(output, src_min, wts_ptr, ids_size, ids_stride);
     *(uint8_t*)&dst[i * strides[0]] = (uint8_t)std::clamp(output >> weights_precision, 0, 255);
   }
 }
@@ -1273,7 +1332,7 @@ struct HelperInterpCubic : public HelperInterpBase {
   template<typename scalar_t>
   static inline scalar_t aa_filter(scalar_t x) {
     // https://en.wikipedia.org/wiki/Bicubic_interpolation#Bicubic_convolution_algorithm
-#define a -0.5
+    constexpr scalar_t a = -0.5;
     if (x < 0.0) {
       x = -x;
     }
@@ -1284,7 +1343,24 @@ struct HelperInterpCubic : public HelperInterpBase {
       return (((x - 5) * x + 8) * x - 4) * a;
     }
     return 0.0;
-#undef a
+  }
+
+  template<typename scalar_t>
+  static inline scalar_t aa_filter_075(scalar_t x) {
+    // https://en.wikipedia.org/wiki/Bicubic_interpolation#Bicubic_convolution_algorithm
+    // In this code we are using alternative a=-0.75 definition that matches
+    // get_cubic_upsample_coefficients implementation
+    constexpr scalar_t a = -0.75;
+    if (x < 0.0) {
+      x = -x;
+    }
+    if (x < 1.0) {
+      return cubic_convolution1(x, a);
+    }
+    if (x < 2.0) {
+      return cubic_convolution2(x, a);
+    }
+    return 0.0;
   }
 
   static inline std::vector<Tensor> compute_indices_weights_aa(
@@ -1326,7 +1402,23 @@ struct HelperInterpCubic : public HelperInterpBase {
     );
     return indices_weights;
   }
-
+  static inline std::tuple<std::vector<Tensor>, int, unsigned int> compute_indices_int16_weights_aa(
+    int64_t input_size,
+    int64_t output_size,
+    int64_t stride,
+    int64_t ndims,
+    int64_t reshape_dim,
+    bool align_corners,
+    const c10::optional<double> opt_scale,
+    bool antialias,
+    bool align_i32=false
+  ) {
+    auto interp_size = HelperInterpCubic::interp_size;
+    auto fn = antialias ? HelperInterpCubic::aa_filter<double> : HelperInterpCubic::aa_filter_075<double>;
+    return HelperInterpCubic::_compute_indices_int16_weights_aa(
+        input_size, output_size, stride, ndims, reshape_dim,
+        align_corners, opt_scale, interp_size, fn, antialias, align_i32);
+  }
 };
 
 // Generic upsampling interpolation kernel for N-d case.
@@ -1414,8 +1506,11 @@ void upsample_generic_Nd_kernel_impl(
   }
 }
 
-template <typename scalar_t, bool is_horizontal>
+template <typename scalar_t, typename input_scalar_t, bool is_horizontal>
 void cpu_upsample_generic_aa(at::TensorIterator& iter, unsigned int weights_precision) {
+
+  // scalar_t is output's dtype
+  // input_scalar_t is input's dtype
 
   auto loop = [&](char** data, const int64_t* strides, int64_t n) {
     if (is_horizontal) {
@@ -1423,25 +1518,25 @@ void cpu_upsample_generic_aa(at::TensorIterator& iter, unsigned int weights_prec
       // Strides are : X 0 | 8 8 8 0 8  (Channels first)
       // Strides are : X X | 0 0 0 0 0  (Channels last)
       // upsampling data within a contiguous dimension (aka horizontal resampling)
-      if ((strides[0] == sizeof(scalar_t)) && (strides[1] == sizeof(scalar_t)) &&
+      if ((strides[0] == sizeof(scalar_t)) && (strides[1] == sizeof(input_scalar_t)) &&
           is_zero_stride<3 + 2>(&strides[2])) {
         // channels last case
-        basic_loop_aa_horizontal<scalar_t>(
+        basic_loop_aa_horizontal<scalar_t, input_scalar_t>(
             data, strides, n, weights_precision);
       } else {
-        basic_loop_aa_horizontal<scalar_t>(
+        basic_loop_aa_horizontal<scalar_t, input_scalar_t>(
             data, strides, n, weights_precision);
       }
     } else {
       // Strides are : X Y | 0 0 0 0 0 (Channels first)
       // Strides are : X X | 0 0 0 0 0 (Channels last)
       // upsampling data between contiguous dimensions (aka vertical resampling)
-      if ((strides[0] == sizeof(scalar_t)) && (strides[1] == sizeof(scalar_t)) &&
+      if ((strides[0] == sizeof(scalar_t)) && (strides[1] == sizeof(input_scalar_t)) &&
           is_zero_stride<3 + 2>(&strides[2])) {
-        basic_loop_aa_vertical<scalar_t>(
+        basic_loop_aa_vertical<scalar_t, input_scalar_t>(
             data, strides, n, weights_precision);
       } else {
-        basic_loop_aa_vertical<scalar_t>(
+        basic_loop_aa_vertical<scalar_t, input_scalar_t>(
             data, strides, n, weights_precision);
       }
     }
@@ -1457,7 +1552,8 @@ void _separable_upsample_generic_Nd_kernel_impl_single_dim(
     int interp_dim,
     bool align_corners,
     const scale_type& scales,
-    bool antialias) {
+    bool antialias,
+    const at::ScalarType & weights_dtype) {
 
   // input can be NCHW, NCL or NCKHW
   auto shape = input.sizes().vec();
@@ -1480,10 +1576,20 @@ void _separable_upsample_generic_Nd_kernel_impl_single_dim(
   unsigned int weights_precision = 0;
   int unused;
 
-  if (F::interp_size == 2 && input_scalar_type == at::kByte) {
-    // This is special branch to provide uint8 dtype support for bilinear mode only
+  // Input can be byte or float or int (if a buffer from the previous step and bicubic)
+  // Output can be byte or float or int (if a buffer from the previous step and bicubic)
+  // For example, bicubic 2d, input/output uint8:
+  // 1) horizontal pass: uint8 -> int
+  // 2) vertical pass: int -> uint8
+
+  // For example, bicubic 3d, input/output uint8:
+  // 1) horizontal pass: uint8 -> int
+  // 2) vertical pass 1: int -> int
+  // 3) vertical pass 2: int -> uint8
+
+  if (weights_dtype == at::kShort) {
     std::tie(indices_weights, unused, weights_precision) =
-      HelperInterpLinear::compute_indices_int16_weights_aa(
+      F::compute_indices_int16_weights_aa(
         input.size(interp_dim), oshape[interp_dim],
         input.stride(interp_dim) * input.element_size(),
         input.dim(), interp_dim, align_corners, scales[interp_dim - 2],
@@ -1511,9 +1617,17 @@ void _separable_upsample_generic_Nd_kernel_impl_single_dim(
 
   auto iter = config.build();
 
-  AT_DISPATCH_FLOATING_TYPES_AND(
-      at::ScalarType::Byte, iter.dtype(), "upsample_generic_Nd_aa", [&] {
-        cpu_upsample_generic_aa<scalar_t, is_horizontal>(iter, weights_precision);
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Byte, at::ScalarType::Int, iter.dtype(), "upsample_generic_Nd_aa", [&] {
+        if (input_scalar_type == at::kByte) {
+          cpu_upsample_generic_aa<scalar_t, uint8_t, is_horizontal>(iter, weights_precision);
+        }
+        else if (input_scalar_type == at::kInt) {
+          cpu_upsample_generic_aa<scalar_t, int32_t, is_horizontal>(iter, weights_precision);
+        }
+        else {
+          cpu_upsample_generic_aa<scalar_t, scalar_t, is_horizontal>(iter, weights_precision);
+        }
       });
 }
 
@@ -1556,22 +1670,25 @@ void separable_upsample_generic_Nd_kernel_impl(
   if (output_shape[interp_dim] != input_shape[interp_dim]) {
 
     num_single_dim_ops -= 1;
+    auto input_scalar_type = input.scalar_type();
+    auto weights_dtype = input_scalar_type;
+    if (input_scalar_type == at::kByte) {
+      weights_dtype = at::kShort;
+    }
+
     if (num_single_dim_ops > 0) {
       temp_oshape[interp_dim] = output_shape[interp_dim];
 
       auto options = input.options();
       // For bicubic case and input uint8 dtype we have to use int32 buffer dtype
-      if (F::interp_size == 4 && input.scalar_type() == at::kByte) {
+      if (input_scalar_type == at::kByte && F::interp_size == 4) {
         options = options.dtype(at::kInt);
       }
-
       temp_output = at::empty(temp_oshape, options);
-
-      // We can remove that
-      if (F::interp_size == 4 && input.scalar_type() == at::kByte) {
+      // We can remove this check
+      if (F::interp_size == 4 && input_scalar_type == at::kByte) {
         TORCH_INTERNAL_ASSERT(temp_output.scalar_type() == at::kInt);
       }
-
     } else {
       temp_output = output;
     }
@@ -1581,13 +1698,19 @@ void separable_upsample_generic_Nd_kernel_impl(
         scale_t,
         F,
         true>(
-        temp_output, temp_input, interp_dim, align_corners, scales, antialias);
+        temp_output, temp_input, interp_dim, align_corners, scales, antialias, weights_dtype);
     temp_input = temp_output;
   }
 
   // upsampling data between contiguous dimensions (aka vertical resampling)
   for (const auto i : c10::irange(1, out_ndims)) {
     interp_dim = 2 + out_ndims - 1 - i;
+    auto input_scalar_type = temp_input.scalar_type();
+    auto weights_dtype = input_scalar_type;
+    if (input_scalar_type == at::kByte || input_scalar_type == at::kInt) {
+      weights_dtype = at::kShort;
+    }
+
     if (output_shape[interp_dim] != input_shape[interp_dim]) {
 
       num_single_dim_ops -= 1;
@@ -1596,17 +1719,15 @@ void separable_upsample_generic_Nd_kernel_impl(
 
         auto options = temp_input.options();
         // For bicubic case and input uint8 dtype we have to use int32 buffer dtype
-        if (F::interp_size == 4 && temp_input.scalar_type() == at::kByte) {
+        if ((input_scalar_type == at::kByte || input_scalar_type == at::kInt) && F::interp_size == 4) {
           options = options.dtype(at::kInt);
         }
-
         temp_output = at::empty(temp_oshape, options);
 
-        // We can remove that
-        if (F::interp_size == 4 && temp_input.scalar_type() == at::kByte) {
+        // We can remove this check
+        if (F::interp_size == 4 && input_scalar_type == at::kByte) {
           TORCH_INTERNAL_ASSERT(temp_output.scalar_type() == at::kInt);
         }
-
       } else {
         temp_output = output;
       }
@@ -1616,7 +1737,7 @@ void separable_upsample_generic_Nd_kernel_impl(
           scale_t,
           F,
           false>(
-          temp_output, temp_input, interp_dim, align_corners, scales, antialias);
+          temp_output, temp_input, interp_dim, align_corners, scales, antialias, weights_dtype);
       temp_input = temp_output;
     }
   }
@@ -1834,12 +1955,14 @@ void upsample_bicubic2d_kernel_impl(
     c10::optional<double> scales_h,
     c10::optional<double> scales_w) {
 
-  // We explicitly checking for non-supported uint8 dtype
-  TORCH_CHECK(input.scalar_type() != at::kByte,
-      "'upsample_bicubic2d_aa_kernel_impl' not implemented for 'Byte'");
-
-  upsample_generic_Nd_kernel_impl<2, scale_t, HelperInterpCubic>(
-    output, input, align_corners, {scales_h, scales_w});
+  if (input.dtype() == at::kByte) {
+    separable_upsample_generic_Nd_kernel_impl<2, scale_t, HelperInterpCubic>(
+        output, input, align_corners, {scales_h, scales_w},
+        /*antialias=*/false);
+  } else {
+    upsample_generic_Nd_kernel_impl<2, scale_t, HelperInterpCubic>(
+        output, input, align_corners, {scales_h, scales_w});
+  }
 }
 
 void upsample_bicubic2d_aa_kernel_impl(
