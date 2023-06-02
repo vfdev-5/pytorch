@@ -492,7 +492,11 @@ inline void basic_loop_aa_horizontal<uint8_t, uint8_t>(
 //
 // The recursive call is implemented with InterpLinear struct using template for
 // the loop unrolling on compile time.
-template <typename scalar_t, int out_ndims, int interp_size>
+
+// scalar_t is dtype for input/output
+// large_output_t is dtype for intermediate output computations, typically int32_t if input/output are uint8_t
+// weights_t is dtype for weights
+template <typename scalar_t, typename large_output_t, typename weights_t, int out_ndims, int interp_size>
 void cpu_upsample_generic(at::TensorIterator& iter)
 {
   auto loop = [&](char** data, const int64_t* strides, int64_t n) {
@@ -814,27 +818,48 @@ struct HelperInterpBase {
     scalar_t invscale = (scale >= 1.0 && antialias) ? 1.0 / scale : 1.0;
     xmin = std::max(
         static_cast<int64_t>(center - support + 0.5 + align_corners_delta), static_cast<int64_t>(0));
-    xsize = std::min(
-        static_cast<int64_t>(center + support + 0.5 + align_corners_delta), input_size) - xmin;
+    if (antialias) {
+      xsize = std::min(
+          static_cast<int64_t>(center + support + 0.5 + align_corners_delta), input_size) - xmin;
+      // There are rare cases when due to precision xsize can be larger than max_interp_size by one.
+      // We have to clip the value
+      xsize = std::clamp(xsize, static_cast<int64_t>(0), max_interp_size);
+    } else {
+      xsize = max_interp_size;
+    }
 
-    // There are rare cases when due to precision xsize can be larger than max_interp_size by one.
-    // We have to clip the value
-    xsize = std::clamp(xsize, static_cast<int64_t>(0), max_interp_size);
+    std::cout << "i: " << i << " "
+              << "center: " << center << " "
+              << "scale: " << scale << " "
+              << "support: " << support << " "
+              << "align_corners_delta: " << align_corners_delta << " "
+              << "\n";
+
+    std::cout << "xmin, xsize: "
+              << xmin << ", "
+              << xsize << "\n";
 
     int64_t j = 0;
     for (; j < xsize; j++) {
       scalar_t w = filter_fn((j + xmin - center + 0.5 - align_corners_delta) * invscale);
+      std::cout << "j, x, w: "
+                << j << " "
+                << (j + xmin_unbounded - center + 0.5 - align_corners_delta) * invscale << " "
+                << w << "\n";
       wt_ptr[j] = w;
       total_w += w;
     }
 
     scalar_t wt_max = 0.0;
+    std::cout << "- Weights: xsize=" << xsize << " ";
     if (total_w != 0.0) {
       for (j = 0; j < xsize; j++) {
         wt_ptr[j] /= total_w;
+        std::cout << wt_ptr[j] << " ";
         wt_max = std::max(wt_max, wt_ptr[j]);
       }
     }
+    std::cout << std::endl;
 
     for (; j < max_interp_size; j++) {
       wt_ptr[j] = static_cast<scalar_t>(0.0);
@@ -1314,12 +1339,20 @@ struct HelperInterpCubic : public HelperInterpBase {
           guard_index_and_lambda(real_input_index, input_size, input_index, lambda);
           get_cubic_upsample_coefficients<opmath_t>(coeffs, lambda);
 
+          std::cout << "i= " << i << " "
+                    << "real_input_index= " << real_input_index << " "
+                    << "input_index= " << input_index << " "
+                    << "lambda= " << lambda << " "
+                    << "weights= ";
           for (const auto j : c10::irange(interp_size)) {
             idx_ptr = output[2 * j + 0].data_ptr<int64_t>();
             idx_ptr[i] = static_cast<int64_t>(std::max(std::min(input_index + j - 1, input_size - 1), zero)) * stride;
             wt_ptr = output[2 * j + 1].data_ptr<scalar_t>();
             wt_ptr[i] = coeffs[j];
+            std::cout << std::max(std::min(input_index + j - 1, input_size - 1), zero) << ", ";
+            std::cout << coeffs[j] << " | ";
           }
+          std::cout << std::endl;
         }
       }
     );
@@ -1490,18 +1523,22 @@ void upsample_generic_Nd_kernel_impl(
   auto iter = config.build();
 
   if (interp_size > 1) {
-    // Nearest also supports uint8 tensor, so need to handle it separately
-    AT_DISPATCH_FLOATING_TYPES_AND(
-        at::ScalarType::BFloat16, iter.dtype(), "upsample_generic_Nd", [&] {
-        // MSVC can not catch constexpr int interp_size here
-        constexpr int mode = F::interp_size;
-        cpu_upsample_generic<scalar_t, out_ndims, mode>(iter);
-    });
+    auto iter_dtype = iter.dtype();
+    if (iter_dtype == at::ScalarType::Byte) {
+      cpu_upsample_generic<scalar_t, int32_t, int16_t, out_ndims, interp_size>(iter);
+    } else {
+      AT_DISPATCH_FLOATING_TYPES_AND(
+          at::ScalarType::BFloat16, iter.dtype(), "upsample_generic_Nd", [&] {
+          // MSVC can not catch constexpr int interp_size here
+          constexpr int mode = F::interp_size;
+          cpu_upsample_generic<scalar_t, scalar_t, scalar_t, out_ndims, mode>(iter);
+      });
+    }
   } else {
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Byte, at::ScalarType::BFloat16,
         iter.dtype(), "upsample_generic_Nd", [&] {
         constexpr int mode = F::interp_size;
-        cpu_upsample_generic<scalar_t, out_ndims, mode>(iter);
+        cpu_upsample_generic<scalar_t, scalar_t, scalar_t, out_ndims, mode>(iter);
     });
   }
 }
@@ -1955,14 +1992,8 @@ void upsample_bicubic2d_kernel_impl(
     c10::optional<double> scales_h,
     c10::optional<double> scales_w) {
 
-  if (input.dtype() == at::kByte) {
-    separable_upsample_generic_Nd_kernel_impl<2, scale_t, HelperInterpCubic>(
-        output, input, align_corners, {scales_h, scales_w},
-        /*antialias=*/false);
-  } else {
-    upsample_generic_Nd_kernel_impl<2, scale_t, HelperInterpCubic>(
-        output, input, align_corners, {scales_h, scales_w});
-  }
+  upsample_generic_Nd_kernel_impl<2, scale_t, HelperInterpCubic>(
+      output, input, align_corners, {scales_h, scales_w});
 }
 
 void upsample_bicubic2d_aa_kernel_impl(
