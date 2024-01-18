@@ -3368,7 +3368,6 @@ def upsample_bilinear2d(
     v3 = aten._unsafe_index(input, [None, None, yp1, x])
     v4 = aten._unsafe_index(input, [None, None, yp1, xp1])
 
-    dtype = torch.float32 if not input.is_floating_point() else input.dtype
     if not input.is_floating_point():
         v1 = v1.to(dtype)
         v2 = v2.to(dtype)
@@ -3984,65 +3983,69 @@ def matmul(tensor1, tensor2):
 
 
 @register_decomposition(aten.upsample_bicubic2d.default)
+@aten.upsample_bicubic2d.default.py_impl(DispatchKey.Autograd)
 @pw_cast_for_opmath
 def upsample_bicubic2d_default(
-    a: Tensor,
+    input: Tensor,
     output_size: Tuple[int, int],
     align_corners: bool,
     scale_h: Optional[float] = None,
     scale_w: Optional[float] = None,
 ) -> Tensor:
-    N, C, iH, iW = a.shape
-    oH, oW = output_size
+    # get dimensions of original image
+    _, _, in_h, in_w = input.shape
 
-    height_scale = _compute_scale(iH, oH, align_corners, scale_h)
-    width_scale = _compute_scale(iW, oW, align_corners, scale_w)
+    # Calculate horizontal and vertical scaling factor
+    h_scale_factor = _compute_scale(in_h, output_size[0], align_corners, scale_h)
+    w_scale_factor = _compute_scale(in_w, output_size[1], align_corners, scale_w)
 
-    if a.is_floating_point():
-        dtype = a.dtype
-    else:
-        dtype = torch.int64
+    _, dtype = utils.elementwise_dtypes(
+        input, type_promotion_kind=utils.ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT
+    )
 
-    N_idx = torch.arange(N, device=a.device, dtype=torch.int64).view(N, 1, 1, 1)
-    C_idx = torch.arange(C, device=a.device, dtype=torch.int64).view(1, C, 1, 1)
-    out_y = torch.arange(oH, device=a.device, dtype=dtype).view((1, 1, oH, 1))
-    out_x = torch.arange(oW, device=a.device, dtype=dtype).view((1, 1, 1, oW))
+    # We have to create arange with int64 dtype and use .to in order to avoid
+    # additional kernels creation in inductor and get a perf slowdown
+    i = torch.arange(output_size[0], device=input.device).to(dtype=dtype)
+    j = torch.arange(output_size[1], device=input.device).to(dtype=dtype)
 
-    real_x = _compute_source_index(width_scale, out_x, align_corners)
-    in_x = real_x.floor()
-    t_x = real_x - in_x
-    ix = in_x.to(dtype=torch.int64)
+    x_f32 = _compute_source_index(w_scale_factor, j, align_corners).clamp(min=0.0)
+    y_f32 = _compute_source_index(h_scale_factor, i, align_corners).clamp(min=0.0)
+    y_f32 = y_f32.unsqueeze(-1)
 
-    real_y = _compute_source_index(height_scale, out_y, align_corners)
-    in_y = real_y.floor()
-    t_y = real_y - in_y
-    iy = in_y.to(dtype=torch.int64)
+    x = x_f32.to(torch.int64)
+    y = y_f32.to(torch.int64)
 
-    iys_ofs = (iy - 1, iy, iy + 1, iy + 2)
-    ixs_ofs = (ix - 1, ix, ix + 1, ix + 2)
+    yscale = (y_f32 - y).clamp(0.0, 1.0).to(dtype)
+    xscale = (x_f32 - x).clamp(0.0, 1.0).to(dtype)
+
+    iys_ofs = (y - 1, y, y + 1, y + 2)
+    ixs_ofs = (x - 1, x, x + 1, x + 2)
 
     def load_bounded(ys, xs):
-        y_idx = torch.clamp(ys, 0, iH - 1)
-        x_idx = torch.clamp(xs, 0, iW - 1)
-        return aten._unsafe_index(a, [N_idx, C_idx, y_idx, x_idx])
+        y_idx = torch.clamp(ys, 0, in_h - 1)
+        x_idx = torch.clamp(xs, 0, in_w - 1)
+        v = aten._unsafe_index(input, [None, None, y_idx, x_idx])
+        if not input.is_floating_point():
+            v = v.to(dtype)
+        return v
 
     def get_x_interp(y):
         coeffs_x = tuple(load_bounded(y, x_ofs) for x_ofs in ixs_ofs)
-        output = _upsample_cubic_interp1d(coeffs_x, t_x)
+        output = _upsample_cubic_interp1d(coeffs_x, xscale)
 
-        if a.dtype == torch.uint8:
+        if input.dtype == torch.uint8:
             output = torch.clamp(output, 0, 255)
 
         return output
 
     coeffs_y = tuple(get_x_interp(y_ofs) for y_ofs in iys_ofs)
-    result = _upsample_cubic_interp1d(coeffs_y, t_y)
+    result = _upsample_cubic_interp1d(coeffs_y, yscale)
 
     # convert output to correct memory format, if necessary
-    memory_format = utils.suggest_memory_format(a)
+    memory_format = utils.suggest_memory_format(input)
     result = result.contiguous(memory_format=memory_format)
 
-    if a.dtype == torch.uint8:
+    if input.dtype == torch.uint8:
         result = torch.clamp(result.round(), 0, 255)
 
     return result
