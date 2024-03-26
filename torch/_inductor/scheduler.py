@@ -779,8 +779,9 @@ class SchedulerNode(BaseSchedulerNode):
                 SimplifyIndexing(V.get_ops_handler(), var_ranges)
             ), V.kernel.set_current_node(self):
                 self._body(*index_vars)
-        except Exception:
+        except Exception as e:
             log.fatal("Error in codegen for %s", self.node)
+            log.fatal("Error: %s", e)
             raise
 
     def pointwise_read_writes(self):

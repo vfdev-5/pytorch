@@ -1523,6 +1523,7 @@ class CppKernel(Kernel):
         self.poststores = IndentedBuffer()
         self.num_threads = num_threads  # num_threads the kernel specialized for
         self.reduction_omp_dec: Dict[Tuple[str, str], str] = {}
+        self.alt_loop_order = None
 
     def _gen_parallel_reduction_buffers(
         self,
@@ -3392,6 +3393,83 @@ class CppKernelProxy(CppKernel):
                     (group, reduction_group),
                     (group + reduction_group, ()),
                 ]:
+                    # Check if we can reorder for-loops under a specific condition
+                    if (
+                        len(node.read_writes.reads) == 1
+                        and len(node.read_writes.writes) == 1
+                    ):
+                        node_group, node_reduction_group = node.group[1]
+                        # nested for-loops
+                        if len(node_group) > 2 and len(node_reduction_group) == 0:
+                            node_read = next(iter(node.read_writes.reads))
+                            outer_loop_var = sympy_index_symbol("c0")
+                            inner_loop_var = sympy_index_symbol(
+                                f"c{len(node_group) - 1}"
+                            )
+
+                            # Check whether we have a non-contiguous read in the load op over the inner-most loop variable
+                            # If true then we check if the outer-most loop variable is only used in the load op and not in the ops before
+                            # If true then we set an alternative loop order: [v0, v1, v2, ... vN-1] -> [v1, v2, ..., vN-1, v0]
+
+                            has_outer_loop_var_in_load = (
+                                outer_loop_var in node_read.index.free_symbols
+                            )
+
+                            # get indexing terms, e.g. (tmp10)*s0*s2 + (tmp21)*s0 + c1 -> [(tmp10)*s0*s2, (tmp21)*s0, c1]
+                            # another example: (tmp10)*s2 + (tmp21) + c0*s1*s2 -> [(tmp10)*s2, (tmp21), c0*s1*s2]
+                            read_terms = node_read.index.as_ordered_terms()
+                            has_contig_read_inner_loop_var = (
+                                inner_loop_var in read_terms
+                            )
+
+                            if (
+                                not has_contig_read_inner_loop_var
+                            ) and has_outer_loop_var_in_load:
+                                body = node._body
+                                graph = body.root_block.graph
+                                graph_nodes = list(graph.nodes)
+
+                                outer_loop_var = sympy_index_symbol("z0")
+                                exprs_using_outer_loop_var = [
+                                    k
+                                    for k, v in body.indexing_exprs.items()
+                                    if outer_loop_var in v.free_symbols
+                                ]
+                                ops_using_outer_loop_var = [  # noqa: C419
+                                    n
+                                    for n in graph_nodes
+                                    if any(
+                                        [  # noqa: C419
+                                            a in exprs_using_outer_loop_var
+                                            for a in n.args
+                                        ]
+                                    )
+                                ]
+
+                                assert len(ops_using_outer_loop_var) > 0, (
+                                    exprs_using_outer_loop_var,
+                                    body.debug_str(),
+                                )
+
+                                # How many computational ops before the first node using outer_loop_var
+                                i = graph_nodes.index(ops_using_outer_loop_var[0])
+                                num_ops_before = len(
+                                    [
+                                        n
+                                        for n in graph_nodes[:i]
+                                        if n.target in ("mul", "add", "to_dtype")
+                                    ]
+                                )
+
+                                if num_ops_before > 10:
+                                    kernel.itervars = vars[1:] + vars[:1]
+                                    kernel.ranges = (
+                                        kernel.ranges[1:] + kernel.ranges[:1]
+                                    )
+                                    kernel.call_ranges = (
+                                        kernel.call_ranges[1:] + kernel.call_ranges[:1]
+                                    )
+
                     assert not in_suffix
                     node.run(vars, reduction_vars)
                 else:
